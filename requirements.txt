@@ -1,3 +1,4 @@
 fastapi
 uvicorn
-git+https://github.com/yt-dlp/yt-dlp.git@master
+requests
+yt-dlp
