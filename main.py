@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
+import requests # Alat baru untuk nelpon API lain
 
 app = FastAPI()
 
@@ -18,56 +19,55 @@ class VideoRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return {"message": "Mesin Rizal Versi TikTok-Killer Aktif!"}
+    return {"message": "Mesin Hybrid Rizal: TikTok (API) + FB (yt-dlp)"}
 
 @app.post("/api/download")
 def download_video(request: VideoRequest):
-    try:
-        # --- KONFIGURASI BARU KHUSUS TIKTOK ---
-        ydl_opts = {
-            'format': 'best',
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True, # Abaikan sertifikat SSL (kadang bikin error)
-            'ignoreerrors': True,
-            
-            # INI TOPENGNYA: Kita menyamar sebagai Google Chrome di Windows
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            
-            # Tambahan untuk ekstraksi TikTok agar lebih bandel
-            'extractor_args': {
-                'tiktok': {
-                    'app_version': ['25.0.0'], # Pura-pura pakai aplikasi versi lama yg stabil
-                    'tt_webid_v2': ['1234567890123456789'] # ID palsu
+    url = request.url
+
+    # --- JALUR 1: KHUSUS TIKTOK & DOUYIN (Pakai TikWM API) ---
+    if "tiktok.com" in url or "douyin.com" in url:
+        try:
+            # Kita minta tolong ke TikWM (Gratis & Stabil)
+            response = requests.post(
+                "https://www.tikwm.com/api/", 
+                data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
+            )
+            data = response.json()
+
+            if data.get("code") == 0:
+                video_data = data.get("data", {})
+                return {
+                    "status": "success",
+                    "title": video_data.get("title", "Video TikTok"),
+                    "thumbnail": video_data.get("cover", ""),
+                    # Prioritaskan link HD, kalau gak ada pakai link biasa
+                    "download_url": video_data.get("play", "")
                 }
-            }
-        }
+            else:
+                return {"status": "error", "message": "Video TikTok tidak ditemukan / Private."}
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Ekstrak info
-            info = ydl.extract_info(request.url, download=False)
-            
-            # Validasi jika gagal mengambil info
-            if not info:
-                return {"status": "error", "message": "Gagal mengambil data video. Mungkin diprivate atau diblokir."}
+        except Exception as e:
+            return {"status": "error", "message": f"Gagal jalur TikTok: {str(e)}"}
 
-            # Ambil data
-            video_url = info.get('url', None)
-            title = info.get('title', 'Video TikTok')
-            thumbnail = info.get('thumbnail', '')
-            
-            # Fallback (Jaga-jaga) jika URL ada di tempat lain
-            if not video_url:
-                 # Kadang TikTok menaruh link di 'entries' kalau berupa playlist
-                 if 'entries' in info:
-                     video_url = info['entries'][0].get('url')
-
-            return {
-                "status": "success",
-                "title": title,
-                "download_url": video_url,
-                "thumbnail": thumbnail
+    # --- JALUR 2: SELAIN TIKTOK (Facebook, IG, dll) Pakai yt-dlp ---
+    else:
+        try:
+            ydl_opts = {
+                'format': 'best',
+                'quiet': True,
+                'no_warnings': True,
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return {
+                    "status": "success",
+                    "title": info.get('title', 'Video'),
+                    "thumbnail": info.get('thumbnail', ''),
+                    "download_url": info.get('url', '')
+                }
 
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": "Gagal mengambil video (yt-dlp)."}
