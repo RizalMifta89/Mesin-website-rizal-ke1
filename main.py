@@ -8,9 +8,8 @@ from pydantic import BaseModel
 from telebot import types
 
 # --- KONFIGURASI ---
-# Ambil Token dari Environment Variable (Setting di Render nanti)
+# Token diambil dari Environment Variable di Render
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
-# Render otomatis menyediakan URL aplikasi kamu di env var ini
 APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
 # Inisialisasi Bot
@@ -18,7 +17,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 app = FastAPI()
 
-# --- CORS ---
+# --- CORS (Agar API bisa diakses website lain jika perlu) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,90 +26,121 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FUNGSI DOWNLOADER (Dipakai oleh API & Bot) ---
+# --- FUNGSI DOWNLOADER (High Quality - Tanpa Cookies) ---
 def process_video_download(url):
     ydl_opts = {
-        'format': 'best', 
+        # 1. MEMAKSA KUALITAS TERBAIK (MP4)
+        # Kita minta format mp4 terbaik yang ada video+audio nya.
+        'format': 'best[ext=mp4]/best', 
+        
+        # 2. MENYAMAR JADI IPHONE (User Agent)
+        # Agar server IG/TikTok mengira ini permintaan dari HP, bukan bot.
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        
+        # 3. PENGATURAN UMUM
         'quiet': True,
         'no_warnings': True,
         'geo_bypass': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'nocheckcertificate': True,
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Ekstrak info video
             info = ydl.extract_info(url, download=False)
+            
+            # Ambil URL video streaming
+            final_url = info.get('url', None)
+            
             return {
                 "status": "success",
                 "title": info.get('title', 'Video Downloaded'),
-                "url": info.get('url', None),
+                "url": final_url,
                 "thumbnail": info.get('thumbnail', '')
             }
+
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        error_msg = str(e)
+        print(f"Error Log: {error_msg}") # Print error ke log Render untuk debugging
+        
+        # Pesan error yang lebih manusiawi untuk user bot
+        if "Sign in" in error_msg or "unavailable" in error_msg:
+            return {"status": "error", "message": "Video tidak bisa diambil (Private/Konten Dewasa/Login Required)."}
+        
+        return {"status": "error", "message": "Gagal mengambil video. Pastikan link valid dan publik."}
 
-# --- LOGIKA BOT TELEGRAM ---
+# --- HANDLER BOT TELEGRAM ---
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "Halo! Kirim link IG/FB/TikTok, saya akan ambilkan videonya.")
+    bot.reply_to(message, "👋 Halo! Kirimkan link TikTok, Instagram, atau Facebook.\nSaya akan kirimkan videonya dengan kualitas terbaik (jika publik).")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    url = message.text
+    url = message.text.strip()
+    
+    # Validasi sederhana
     if not url.startswith(('http', 'www')):
-        bot.reply_to(message, "Link tidak valid.")
+        bot.reply_to(message, "❌ Link tidak valid. Pastikan link diawali http atau www.")
         return
 
-    msg = bot.reply_to(message, "⏳ Mencari video...")
+    # Kirim notifikasi "Sedang mengetik/mengirim video..."
+    bot.send_chat_action(message.chat.id, 'upload_video')
+    msg_loading = bot.reply_to(message, "⏳ Sedang memproses video HD...")
     
-    # Panggil fungsi downloader yang sama dengan API
+    # Jalankan proses download
     result = process_video_download(url)
 
     if result['status'] == 'success':
         try:
+            # Kirim Video
             bot.send_video(
                 message.chat.id,
                 result['url'],
                 caption=f"🎥 **{result['title']}**",
                 parse_mode="Markdown"
             )
-            bot.delete_message(message.chat.id, msg.message_id)
+            # Hapus pesan loading agar chat bersih
+            bot.delete_message(message.chat.id, msg_loading.message_id)
+            
         except Exception as e:
-            bot.edit_message_text(f"Gagal kirim: {e}", message.chat.id, msg.message_id)
+            # Kadang URL valid tapi file terlalu besar untuk Telegram atau expired cepat
+            bot.edit_message_text(f"⚠️ Gagal mengirim video ke Telegram.\nError: {e}", message.chat.id, msg_loading.message_id)
     else:
-        bot.edit_message_text(f"Gagal download: {result['message']}", message.chat.id, msg.message_id)
+        # Jika gagal download (misal private)
+        bot.edit_message_text(f"❌ {result['message']}", message.chat.id, msg_loading.message_id)
 
-# --- RUTE FASTAPI ---
+# --- RUTE FASTAPI (WEBHOOK & API) ---
 
 class VideoRequest(BaseModel):
     url: str
 
 @app.get("/")
 def home():
-    return {"message": "Server Bot & API Aktif!"}
+    return {"message": "Server Bot Telegram Aktif!"}
 
-# Endpoint Webhook untuk Telegram (Rahasia)
+# Endpoint Webhook (Pintu masuk pesan Telegram)
 @app.post(f"/webhook/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
-    # Terima update dari Telegram
     json_str = await request.json()
     update = telebot.types.Update.de_json(json_str)
     bot.process_new_updates([update])
     return "OK"
 
-# Endpoint API Download (Yang kamu minta sebelumnya)
+# Endpoint API (Opsional, jika kamu masih pakai untuk website)
 @app.post("/api/download")
 def download_video_api(request: VideoRequest):
     return process_video_download(request.url)
 
-# --- SET WEBHOOK SAAT STARTUP ---
-# Ini penting agar Telegram tahu harus kirim pesan ke mana
+# --- SETTING WEBHOOK SAAT STARTUP ---
 @app.on_event("startup")
 def set_webhook():
     if BOT_TOKEN and APP_URL:
         webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
-        print(f"Setting webhook to: {webhook_url}")
+        # Hapus webhook lama dulu biar bersih
         bot.remove_webhook()
+        # Set webhook baru
         bot.set_webhook(url=webhook_url)
+        print(f"Webhook berhasil di-set ke: {webhook_url}")
     else:
-        print("BOT_TOKEN atau RENDER_EXTERNAL_URL belum diset.")
+        print("PERINGATAN: BOT_TOKEN atau RENDER_EXTERNAL_URL belum diset di Environment Variables.")
